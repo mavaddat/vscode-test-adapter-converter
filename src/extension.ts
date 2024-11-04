@@ -16,7 +16,7 @@ export function activate(context: vscode.ExtensionContext) {
   let factory: TestConverterFactory | undefined;
 
   const optIn = new OptInController(context);
-  if (vscode.env.appName.toLowerCase().includes('insiders') && optIn.shouldPrompt()) {
+  if (optIn.shouldPrompt()) {
     setTimeout(() => {
       const testHub = vscode.extensions.getExtension<TestHub>(testExplorerExtensionId)?.exports;
 
@@ -64,6 +64,18 @@ export function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('testExplorerConverter.useNativeTesting', () =>
       switchToNativeTesting()
-    )
+    ),
+
+    vscode.commands.registerCommand('testExplorerConverter.showError', controllerId => {
+      const error = factory?.getByControllerId(controllerId)?.error;
+      if (error) {
+        openUntitledEditor(error);
+      }
+    })
   );
 }
+
+const openUntitledEditor = async (contents: string) => {
+  const untitledDoc = await vscode.workspace.openTextDocument({ content: contents });
+  await vscode.window.showTextDocument(untitledDoc);
+};

@@ -2,6 +2,8 @@
  * Copyright (C) Microsoft Corporation. All rights reserved.
  *--------------------------------------------------------*/
 
+import * as ansiColors from 'ansi-colors';
+import { parse as parseStack } from 'stacktrace-parser';
 import * as vscode from 'vscode';
 import {
   TestAdapter,
@@ -35,13 +37,64 @@ const unique = <T, R>(arr: readonly T[], project: (v: T) => R): T[] => {
 const testViewId = 'workbench.view.extension.test';
 let nextControllerId = 1;
 
+const getControllerName = () => {
+  /* The test explorer extension doesn't tell us the name of the controller
+  creating the profiles. But, it is in the stacktrace! So try to parse it out. Example:
+
+  Error:
+    at eval (eval-5a7aa349.repl:1:1)
+    at new TestConverter (c:\\Users\\conno\\Github\\vscode-test-adapter-converter\\out\\extension.js:142:5)
+    at TestConverterFactory.registerTestAdapter (c:\\Users\\conno\\Github\\vscode-test-adapter-converter\\out\\extension.js:415:34)
+    at TestHub.registerTestAdapter (c:\\Users\\conno\\.vscode-insiders\\extensions\\hbenl.vscode-test-explorer-2.22.1\\out\\hub\\testHub.js:42:24)
+    at Object.registerTestAdapter (c:\\Users\\conno\\.vscode-insiders\\extensions\\hbenl.vscode-test-explorer-2.22.1\\out\\main.js:106:45)
+    at TestAdapterRegistrar.add (c:\\Users\\conno\\.vscode-insiders\\extensions\\hbenl.vscode-mocha-test-adapter-2.14.1\\node_modules\\vscode-test-adapter-util\\out\\registrar.js:48:22)
+    at new TestAdapterRegistrar (c:\\Users\\conno\\.vscode-insiders\\extensions\\hbenl.vscode-mocha-test-adapter-2.14.1\\node_modules\\vscode-test-adapter-util\\out\\registrar.js:19:22)
+  */
+
+  const stack = parseStack(new Error().stack || '');
+  for (const frame of stack) {
+    if (!frame.file) {
+      continue;
+    }
+
+    const parts = frame.file.split(/[\\/]/g);
+    const extensionsIndex = parts.indexOf('extensions');
+    if (extensionsIndex === -1) {
+      continue;
+    }
+
+    const extensionAndVersionPart = parts[extensionsIndex + 1];
+    const extensionId = extensionAndVersionPart.replace(/-[\d.]+$/, '');
+    if (
+      extensionId.includes('vscode-test-explorer') ||
+      extensionId.includes('test-adapter-converter')
+    ) {
+      continue;
+    }
+
+    return extensionId;
+  }
+
+  return 'Test Adapter Converter';
+};
+
+interface IRunningTaskData {
+  task: vscode.TestRun;
+  announcedTests: Set<vscode.TestItem>;
+}
+
 export class TestConverter implements vscode.Disposable {
   private readonly controller: vscode.TestController;
   private doneDiscovery?: () => void;
   private readonly itemsById = new Map<string, vscode.TestItem>();
-  private readonly tasksByRunId = new Map<string, vscode.TestRun>();
+  private readonly tasksByRunId = new Map<string, IRunningTaskData>();
   private readonly runningSuiteByRunId = new Map<string, vscode.TestItem>();
   private readonly disposables: vscode.Disposable[] = [];
+  private _error?: string;
+
+  public get error() {
+    return this._error;
+  }
 
   public get controllerId() {
     return this.controller.id;
@@ -50,46 +103,72 @@ export class TestConverter implements vscode.Disposable {
   constructor(private readonly adapter: TestAdapter) {
     this.controller = vscode.tests.createTestController(
       `test-adapter-ctrl-${nextControllerId++}`,
-      ''
+      getControllerName()
     );
     this.controller.refreshHandler = () => this.adapter.load();
     this.disposables.push(this.controller);
 
     const makeRunHandler =
       (debug: boolean) => (request: vscode.TestRunRequest, token: vscode.CancellationToken) => {
-        if (!request.include) {
-          this.run(this.controller.createTestRun(request), request.include, debug, token);
-          return;
-        }
-
-        const involved = new Map<TestConverter, vscode.TestItem[]>();
-        for (const test of request.include) {
-          const converter = metadata.get(test)!.converter;
-          const i = involved.get(converter);
-          if (i) {
-            i.push(test);
-          } else {
-            involved.set(converter, [test]);
-          }
-        }
-
-        for (const [converter, tests] of involved) {
-          converter.run(this.controller.createTestRun(request), tests, debug, token);
+        if (request.continuous && adapter.retire) {
+          const disposables = [
+            adapter.retire(evt => {
+              runOrDebug(
+                debug,
+                request,
+                evt.tests?.map(id => this.itemsById.get(id)).filter(d => !!d),
+                token
+              );
+            }),
+            token.onCancellationRequested(() => disposables.forEach(d => d.dispose())),
+          ];
+        } else {
+          runOrDebug(debug, request, request.include, token);
         }
       };
 
-    this.controller.createRunProfile(
+    const runOrDebug = (
+      debug: boolean,
+      request: vscode.TestRunRequest,
+      include: readonly vscode.TestItem[] | undefined,
+      token: vscode.CancellationToken
+    ) => {
+      if (!include) {
+        this.run(this.controller.createTestRun(request), include, debug, token);
+        return;
+      }
+
+      const involved = new Map<TestConverter, vscode.TestItem[]>();
+      for (const test of include) {
+        const converter = metadata.get(test)!.converter;
+        const i = involved.get(converter);
+        if (i) {
+          i.push(test);
+        } else {
+          involved.set(converter, [test]);
+        }
+      }
+
+      for (const [converter, tests] of involved) {
+        converter.run(this.controller.createTestRun(request), tests, debug, token);
+      }
+    };
+
+    const run = this.controller.createRunProfile(
       'Run',
       vscode.TestRunProfileKind.Run,
       makeRunHandler(false),
       true
     );
-    this.controller.createRunProfile(
+    run.supportsContinuousRun = !!adapter.retire;
+
+    const debug = this.controller.createRunProfile(
       'Debug',
       vscode.TestRunProfileKind.Debug,
       makeRunHandler(true),
       true
     );
+    debug.supportsContinuousRun = !!adapter.retire;
 
     this.disposables.push(
       adapter.tests(evt => {
@@ -118,22 +197,34 @@ export class TestConverter implements vscode.Disposable {
         }
       }),
       adapter.testStates(evt => {
-        const task = this.tasksByRunId.get(evt.testRunId ?? '');
-        if (!task) {
+        const data = this.tasksByRunId.get(evt.testRunId ?? '');
+        if (!data) {
           return;
         }
 
         switch (evt.type) {
           case 'test':
-            return this.onTestEvent(task, evt);
+            return this.onTestEvent(data, evt);
           case 'suite':
             return this.onTestSuiteEvent(evt);
           case 'finished':
             this.tasksByRunId.delete(evt.testRunId ?? '');
-            return task.end();
+            return data.task.end();
         }
       })
     );
+    if (adapter.retire) {
+      this.disposables.push(
+        adapter.retire(evt => {
+          if (evt.tests) {
+            const items = evt.tests.map(test => this.itemsById.get(test)).filter(item => !!item);
+            this.controller.invalidateTestResults(items);
+          } else {
+            this.controller.invalidateTestResults();
+          }
+        })
+      );
+    }
   }
 
   public dispose() {
@@ -169,7 +260,7 @@ export class TestConverter implements vscode.Disposable {
         }
       }
 
-      this.tasksByRunId.set(evt.testRunId ?? '', run);
+      this.tasksByRunId.set(evt.testRunId ?? '', { task: run, announcedTests: new Set() });
       token.onCancellationRequested(() => this.adapter.cancel());
       listener.dispose();
     });
@@ -192,7 +283,14 @@ export class TestConverter implements vscode.Disposable {
       this.syncItemChildren(this.controller.items, evt.suite.children);
     } else if (evt.errorMessage) {
       const test = this.controller.createTestItem('error', 'Test discovery failed');
-      test.error = evt.errorMessage;
+      this._error =
+        evt.errorMessage + '\n\n\n' + new Error().stack?.replace('Error:', 'Stacktrace:');
+      test.error = new vscode.MarkdownString(
+        `[View details](command:testExplorerConverter.showError?${encodeURIComponent(
+          JSON.stringify([this.controllerId])
+        )})`
+      );
+      test.error.isTrusted = true;
       this.controller.items.replace([test]);
     }
   }
@@ -258,7 +356,7 @@ export class TestConverter implements vscode.Disposable {
   /**
    * TestEvent handler.
    */
-  private onTestEvent(task: vscode.TestRun, evt: TestEvent) {
+  private onTestEvent({ task, announcedTests }: IRunningTaskData, evt: TestEvent) {
     const runningSuite = this.runningSuiteByRunId.get(evt.testRunId ?? '');
     const testId = typeof evt.test === 'string' ? evt.test : evt.test.id;
     if (
@@ -276,20 +374,29 @@ export class TestConverter implements vscode.Disposable {
 
     switch (evt.state) {
       case 'skipped':
+        this.appendState(task, vscodeTest, '○', ansiColors.yellow, ansiColors.dim);
         task.skipped(vscodeTest);
         break;
       case 'running':
         task.started(vscodeTest);
         break;
       case 'passed':
+        this.ensureChainAnnounced(task, announcedTests, vscodeTest);
+        this.appendState(task, vscodeTest, '✔', ansiColors.green);
         task.passed(vscodeTest);
         break;
       case 'errored':
       case 'failed':
+        this.ensureChainAnnounced(task, announcedTests, vscodeTest);
+        this.appendState(task, vscodeTest, '✖', ansiColors.red, ansiColors.red);
+
         const messages: vscode.TestMessage[] = [];
         if (evt.message) {
-          const message = new vscode.TestMessage(evt.message);
-          messages.push(message);
+          task.appendOutput(evt.message.replace(/\r?\n/g, '\r\n'), undefined, vscodeTest);
+          if (!evt.decorations?.length) {
+            const message = new vscode.TestMessage(evt.message);
+            messages.push(message);
+          }
         }
 
         for (const decoration of evt.decorations ?? []) {
@@ -309,6 +416,42 @@ export class TestConverter implements vscode.Disposable {
     if (evt.message && ((evt.state !== 'errored' && evt.state !== 'failed') || !vscodeTest.uri)) {
       task.appendOutput(evt.message.replace(/\r?\n/g, '\r\n'));
     }
+  }
+
+  private ensureChainAnnounced(
+    task: vscode.TestRun,
+    announcedTests: Set<vscode.TestItem>,
+    leafTest: vscode.TestItem
+  ) {
+    const chain: vscode.TestItem[] = [];
+    for (
+      let item: vscode.TestItem | undefined = leafTest;
+      item && !announcedTests.has(item);
+      item = item.parent
+    ) {
+      chain.unshift(item);
+    }
+
+    for (const item of chain) {
+      announcedTests.add(item);
+      if (item.children.size) {
+        this.appendState(task, item, '▼', ansiColors.green);
+      }
+    }
+  }
+
+  private appendState(
+    task: vscode.TestRun,
+    vscodeTest: vscode.TestItem,
+    symbol: string,
+    symbolColor: (s: string) => string,
+    textColor: (s: string) => string = s => s
+  ) {
+    let indent = '';
+    for (let parent = vscodeTest.parent; parent; parent = parent.parent) {
+      indent += '  ';
+    }
+    task.appendOutput(indent + symbolColor(symbol) + textColor(` ${vscodeTest.label}\r\n`));
   }
 }
 
